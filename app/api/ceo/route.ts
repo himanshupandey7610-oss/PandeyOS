@@ -1,285 +1,245 @@
 import { NextRequest, NextResponse } from "next/server";
-import { kernel } from "@/lib/kernel/kernel";
 
-type ParsedTask = {
-  title: string;
-  department: string;
-  owner?: string;
-  dependency?: string;
-  expectedOutput?: string;
-};
+// =====================================================
+// PANDeyOS CEO AGENT
+// Ollama + qwen3:8b
+// =====================================================
 
-function cleanText(value: string): string {
-  return value
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\r")
-    .replace(/\*\*/g, "")
-    .trim();
+const OLLAMA_URL =
+  process.env.OLLAMA_URL ||
+  "http://127.0.0.1:11434/api/chat";
+
+const MODEL =
+  process.env.OLLAMA_MODEL ||
+  "qwen3:8b";
+
+// =====================================================
+// CEO SYSTEM PROMPT
+// =====================================================
+
+const CEO_SYSTEM_PROMPT = `
+You are the CEO Agent of PandeyOS.
+
+Your job is to act as the strategic brain of an AI workforce.
+
+You DO NOT perform the user's work yourself.
+
+You analyze the user's goal and create an executable workforce plan that the Kernel can convert into missions and tasks.
+
+Your responsibilities:
+
+1. Understand the user's goal.
+2. Identify the desired outcome.
+3. Identify requirements and constraints.
+4. Decide which specialized agents are needed.
+5. Define responsibilities for each agent.
+6. Break the mission into concrete tasks.
+7. Define task dependencies.
+8. Define execution order.
+9. Define quality-control checks.
+10. Define the final deliverable.
+11. Define the immediate next action.
+12. Avoid unnecessary agents.
+13. Keep the plan practical and executable.
+
+IMPORTANT:
+Return ONLY valid JSON.
+
+Do NOT use markdown.
+Do NOT use code fences.
+Do NOT add explanations before or after the JSON.
+
+The JSON MUST follow exactly this structure:
+
+{
+  "mission": {
+    "objective": "string",
+    "desiredOutcome": "string",
+    "requirements": ["string"],
+    "assumptions": ["string"],
+    "risks": ["string"]
+  },
+  "agents": [
+    {
+      "id": "agent-1",
+      "name": "string",
+      "whyNeeded": "string",
+      "responsibility": "string",
+      "tasks": [
+        {
+          "id": "task-1",
+          "title": "string",
+          "description": "string",
+          "dependsOn": [],
+          "expectedOutput": "string"
+        }
+      ]
+    }
+  ],
+  "executionOrder": [
+    {
+      "step": 1,
+      "taskId": "task-1",
+      "ownerAgentId": "agent-1",
+      "dependsOn": []
+    }
+  ],
+  "qualityControl": {
+    "mustReview": ["string"],
+    "tests": ["string"],
+    "successCriteria": ["string"],
+    "failureAction": "string"
+  },
+  "finalDeliverable": "string",
+  "nextAction": "string"
 }
 
-function parseCEOPlan(plan: string): {
-  tasks: ParsedTask[];
-  finalDeliverable?: string;
-  nextAction?: string;
-} {
-  const tasks: ParsedTask[] = [];
+Rules:
 
-  const normalizedPlan = cleanText(plan);
+- Every task must have a unique ID.
+- Every agent must have a unique ID.
+- dependsOn must contain task IDs.
+- executionOrder must contain the tasks in the order they should be executed.
+- Keep tasks specific and actionable.
+- Do not create agents unless they are actually needed.
+- If the goal is simple, use fewer agents.
+- If information is missing, state reasonable assumptions.
+- The finalDeliverable must describe what the user should ultimately receive.
+- nextAction must describe the first practical action the workforce should take.
 
-  console.log("");
-  console.log("=================================");
-  console.log("PandeyOS CEO Plan Parser");
-  console.log("=================================");
-  console.log("Plan length:", normalizedPlan.length);
-  console.log("=================================");
-  console.log("");
+Think strategically before producing the JSON.
+`;
 
-  // ---------------------------------------------
-  // FINAL DELIVERABLE
-  // ---------------------------------------------
+// =====================================================
+// HELPERS
+// =====================================================
 
-  const finalDeliverableMatch = normalizedPlan.match(
-    /FINAL DELIVERABLE\s*:?\s*([\s\S]*?)(?=\n\s*NEXT ACTION|$)/i
-  );
+function cleanJSON(text: string): string {
+  let result = text.trim();
 
-  const finalDeliverable = finalDeliverableMatch
-    ? cleanText(finalDeliverableMatch[1])
-    : undefined;
+  // Remove markdown code fences if the model accidentally adds them.
+  result = result.replace(/^```json\s*/i, "");
+  result = result.replace(/^```\s*/i, "");
+  result = result.replace(/\s*```$/i, "");
 
-  // ---------------------------------------------
-  // NEXT ACTION
-  // ---------------------------------------------
+  result = result.trim();
 
-  const nextActionMatch = normalizedPlan.match(
-    /NEXT ACTION\s*:?\s*([\s\S]*)$/i
-  );
+  // If there is extra text around the JSON,
+  // extract the outermost JSON object.
+  const firstBrace = result.indexOf("{");
+  const lastBrace = result.lastIndexOf("}");
 
-  const nextAction = nextActionMatch
-    ? cleanText(nextActionMatch[1])
-    : undefined;
-
-  // ---------------------------------------------
-  // AGENT SECTIONS
-  // ---------------------------------------------
-
-  const agentRegex =
-    /AGENT\s+\d+([\s\S]*?)(?=\n\s*AGENT\s+\d+|\n\s*EXECUTION ORDER|\n\s*QUALITY CONTROL|\n\s*FINAL DELIVERABLE|$)/gi;
-
-  const agentSections = [
-    ...normalizedPlan.matchAll(agentRegex),
-  ];
-
-  console.log(
-    "CEO agent sections found:",
-    agentSections.length
-  );
-
-  for (const match of agentSections) {
-    const section = match[1] || "";
-
-    // -------------------------------------------
-    // Agent name
-    // -------------------------------------------
-
-    const nameMatch = section.match(
-      /Name\s*:\s*(.+)/i
+  if (
+    firstBrace !== -1 &&
+    lastBrace !== -1 &&
+    lastBrace > firstBrace
+  ) {
+    result = result.slice(
+      firstBrace,
+      lastBrace + 1
     );
+  }
 
-    const owner = nameMatch
-      ? cleanText(nameMatch[1])
-      : undefined;
+  return result.trim();
+}
 
-    console.log(
-      "Parsing agent:",
-      owner || "Unknown Agent"
-    );
+function isObject(value: unknown): value is Record<string, any> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  );
+}
 
-    // -------------------------------------------
-    // Tasks block
-    // -------------------------------------------
+function isValidCEOPlan(plan: any): boolean {
+  if (!isObject(plan)) {
+    return false;
+  }
 
-    const tasksMatch = section.match(
-      /Tasks\s*:\s*([\s\S]*?)(?=\n\s*Expected output\s*:|\n\s*Expected Output\s*:|$)/i
-    );
+  if (!isObject(plan.mission)) {
+    return false;
+  }
 
-    if (!tasksMatch) {
-      console.log(
-        "No Tasks block found for:",
-        owner || "Unknown Agent"
-      );
+  if (
+    typeof plan.mission.objective !== "string" ||
+    typeof plan.mission.desiredOutcome !== "string"
+  ) {
+    return false;
+  }
 
-      continue;
+  if (!Array.isArray(plan.mission.requirements)) {
+    return false;
+  }
+
+  if (!Array.isArray(plan.mission.assumptions)) {
+    return false;
+  }
+
+  if (!Array.isArray(plan.mission.risks)) {
+    return false;
+  }
+
+  if (!Array.isArray(plan.agents)) {
+    return false;
+  }
+
+  if (!Array.isArray(plan.executionOrder)) {
+    return false;
+  }
+
+  if (!isObject(plan.qualityControl)) {
+    return false;
+  }
+
+  if (
+    !Array.isArray(plan.qualityControl.mustReview) ||
+    !Array.isArray(plan.qualityControl.tests) ||
+    !Array.isArray(plan.qualityControl.successCriteria) ||
+    typeof plan.qualityControl.failureAction !== "string"
+  ) {
+    return false;
+  }
+
+  if (
+    typeof plan.finalDeliverable !== "string" ||
+    typeof plan.nextAction !== "string"
+  ) {
+    return false;
+  }
+
+  for (const agent of plan.agents) {
+    if (!isObject(agent)) {
+      return false;
     }
 
-    const taskBlock = cleanText(
-      tasksMatch[1]
-    );
+    if (
+      typeof agent.id !== "string" ||
+      typeof agent.name !== "string" ||
+      typeof agent.whyNeeded !== "string" ||
+      typeof agent.responsibility !== "string" ||
+      !Array.isArray(agent.tasks)
+    ) {
+      return false;
+    }
 
-    // -------------------------------------------
-    // Expected output
-    // -------------------------------------------
-
-    const outputMatch = section.match(
-      /Expected output\s*:\s*([\s\S]*?)(?=\n\s*AGENT\s+\d+|\n\s*EXECUTION ORDER|\n\s*QUALITY CONTROL|$)/i
-    );
-
-    const expectedOutput = outputMatch
-      ? cleanText(outputMatch[1])
-      : undefined;
-
-    // -------------------------------------------
-    // Parse individual task lines
-    // -------------------------------------------
-
-    const taskLines = taskBlock
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    for (const line of taskLines) {
-      const cleaned = line
-        .replace(/^\d+[\.\)]\s*/, "")
-        .replace(/^[-*]\s*/, "")
-        .replace(/^\*\*\d+[\.\)]?\s*/, "")
-        .replace(/\*\*/g, "")
-        .trim();
-
-      if (!cleaned) {
-        continue;
+    for (const task of agent.tasks) {
+      if (!isObject(task)) {
+        return false;
       }
 
-      // Ignore headings accidentally captured as tasks.
       if (
-        /^expected output:?$/i.test(cleaned) ||
-        /^responsibility:?$/i.test(cleaned) ||
-        /^tasks:?$/i.test(cleaned) ||
-        /^why needed:?$/i.test(cleaned)
+        typeof task.id !== "string" ||
+        typeof task.title !== "string" ||
+        typeof task.description !== "string" ||
+        !Array.isArray(task.dependsOn) ||
+        typeof task.expectedOutput !== "string"
       ) {
-        continue;
+        return false;
       }
-
-      tasks.push({
-        title: cleaned,
-        department: owner || "General",
-        owner,
-        expectedOutput,
-      });
     }
   }
 
-  // ---------------------------------------------
-  // FALLBACK
-  // ---------------------------------------------
-
-  if (tasks.length === 0) {
-    console.warn(
-      "CEO parser produced 0 tasks."
-    );
-
-    tasks.push({
-      title:
-        "Execute the first action defined by the CEO plan",
-      department: "CEO",
-      owner: "CEO Agent",
-      expectedOutput: finalDeliverable,
-    });
-  }
-
-  // ---------------------------------------------
-  // Dependencies
-  // ---------------------------------------------
-
-  for (let i = 0; i < tasks.length; i++) {
-    tasks[i].dependency =
-      i === 0
-        ? "None"
-        : `Task ${i}`;
-  }
-
-  console.log("");
-  console.log(
-    "Parsed CEO tasks:",
-    tasks.length
-  );
-
-  tasks.forEach((task, index) => {
-    console.log(
-      `${index + 1}. ${task.title} | Owner: ${task.owner}`
-    );
-  });
-
-  console.log("");
-
-  return {
-    tasks,
-    finalDeliverable,
-    nextAction,
-  };
-}
-
-// =====================================================
-// GET
-// =====================================================
-
-export async function GET(
-  request: NextRequest
-) {
-  try {
-    const { searchParams } =
-      new URL(request.url);
-
-    const missionId =
-      searchParams.get("missionId");
-
-    // ---------------------------------------------
-    // Get one mission
-    // ---------------------------------------------
-
-    if (missionId) {
-      const mission =
-        kernel.getMission(missionId);
-
-      if (!mission) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "Mission not found.",
-          },
-          { status: 404 }
-        );
-      }
-
-      return NextResponse.json({
-        success: true,
-        mission,
-      });
-    }
-
-    // ---------------------------------------------
-    // Get all missions
-    // ---------------------------------------------
-
-    return NextResponse.json({
-      success: true,
-      missions: kernel.getAllMissions(),
-    });
-  } catch (error) {
-    console.error(
-      "Kernel GET error:",
-      error
-    );
-
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to retrieve missions.",
-      },
-      { status: 500 }
-    );
-  }
+  return true;
 }
 
 // =====================================================
@@ -289,20 +249,21 @@ export async function GET(
 export async function POST(
   request: NextRequest
 ) {
+  const startedAt = Date.now();
+
   try {
+    // -------------------------------------------------
+    // Read request body
+    // -------------------------------------------------
+
     const body = await request.json();
 
-    const goal = body?.goal;
+    const goal =
+      typeof body?.goal === "string"
+        ? body.goal.trim()
+        : "";
 
-    // ---------------------------------------------
-    // Validate goal
-    // ---------------------------------------------
-
-    if (
-      !goal ||
-      typeof goal !== "string" ||
-      !goal.trim()
-    ) {
+    if (!goal) {
       return NextResponse.json(
         {
           success: false,
@@ -312,144 +273,379 @@ export async function POST(
       );
     }
 
-    const cleanGoal = goal.trim();
-
     console.log("");
     console.log("=================================");
-    console.log("PandeyOS Kernel");
-    console.log("New Goal");
+    console.log("PandeyOS CEO Agent");
     console.log("=================================");
-    console.log(cleanGoal);
+    console.log("Goal:", goal);
+    console.log("Model:", MODEL);
+    console.log("Ollama URL:", OLLAMA_URL);
     console.log("=================================");
     console.log("");
 
-    // ---------------------------------------------
-    // Ask CEO Agent to create workforce plan
-    // ---------------------------------------------
+    // -------------------------------------------------
+    // Build Ollama request
+    // -------------------------------------------------
+
+    const ollamaPayload = {
+      model: MODEL,
+      stream: false,
+      format: "json",
+      messages: [
+        {
+          role: "system",
+          content: CEO_SYSTEM_PROMPT,
+        },
+        {
+          role: "user",
+          content: `
+USER GOAL:
+
+${goal}
+
+Analyze this goal and create the workforce plan.
+Return ONLY the required JSON.
+`,
+        },
+      ],
+      options: {
+        temperature: 0.2,
+      },
+    };
 
     console.log(
-      "Kernel: requesting CEO workforce plan..."
+      "CEO: sending request to Ollama..."
     );
 
-    const ceoUrl = new URL(
-      "/api/ceo",
-      request.url
-    );
+    // -------------------------------------------------
+    // Timeout
+    // -------------------------------------------------
 
-    const ceoResponse = await fetch(
-      ceoUrl,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          goal: cleanGoal,
-        }),
-        cache: "no-store",
-      }
-    );
+    const controller =
+      new AbortController();
 
-    const ceoData =
-      await ceoResponse.json();
-
-    if (!ceoResponse.ok) {
+    const timeout = setTimeout(() => {
       console.error(
-        "CEO Agent returned error:",
-        ceoData
+        "CEO: Ollama request timed out."
       );
 
-      return NextResponse.json(
+      controller.abort();
+    }, 120000);
+
+    let ollamaResponse: Response;
+
+    try {
+      ollamaResponse = await fetch(
+        OLLAMA_URL,
         {
-          success: false,
-          error:
-            ceoData?.error ||
-            "CEO Agent failed to create a workforce plan.",
-        },
-        { status: 500 }
-      );
-    }
-
-    const plan =
-      typeof ceoData?.result === "string"
-        ? ceoData.result.trim()
-        : "";
-
-    if (!plan) {
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "CEO Agent returned an empty workforce plan.",
-        },
-        { status: 500 }
-      );
-    }
-
-    console.log("");
-    console.log(
-      "CEO plan received successfully."
-    );
-    console.log(
-      "CEO model:",
-      ceoData?.model || "unknown"
-    );
-    console.log(
-      "Plan length:",
-      plan.length
-    );
-    console.log("");
-
-    // ---------------------------------------------
-    // Parse CEO plan
-    // ---------------------------------------------
-
-    const parsed =
-      parseCEOPlan(plan);
-
-    // ---------------------------------------------
-    // Create mission WITH tasks
-    // ---------------------------------------------
-
-    const mission =
-      kernel.createMission(
-        cleanGoal,
-        {
-          plan,
-          nextAction:
-            parsed.nextAction,
-          finalDeliverable:
-            parsed.finalDeliverable,
-          tasks: parsed.tasks,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(
+            ollamaPayload
+          ),
+          signal: controller.signal,
+          cache: "no-store",
         }
       );
+    } catch (error) {
+      clearTimeout(timeout);
+
+      if (
+        error instanceof Error &&
+        error.name === "AbortError"
+      ) {
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              "CEO Agent timed out while waiting for Ollama.",
+          },
+          { status: 504 }
+        );
+      }
+
+      console.error(
+        "CEO: failed to connect to Ollama:",
+        error
+      );
+
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "Failed to connect to Ollama. Make sure Ollama is running.",
+        },
+        { status: 502 }
+      );
+    }
+
+    clearTimeout(timeout);
+
+    // -------------------------------------------------
+    // Read Ollama response safely
+    // -------------------------------------------------
+
+    const rawOllamaResponse =
+      await ollamaResponse.text();
+
+    console.log(
+      "CEO: Ollama HTTP status:",
+      ollamaResponse.status
+    );
+
+    console.log(
+      "CEO: Ollama response length:",
+      rawOllamaResponse.length
+    );
+
+    if (!ollamaResponse.ok) {
+      console.error(
+        "CEO: Ollama returned an error:"
+      );
+
+      console.error(
+        rawOllamaResponse.slice(0, 4000)
+      );
+
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            `Ollama returned HTTP ${ollamaResponse.status}. ` +
+            rawOllamaResponse.slice(0, 1000),
+        },
+        { status: 502 }
+      );
+    }
+
+    if (!rawOllamaResponse.trim()) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "Ollama returned an empty response.",
+        },
+        { status: 502 }
+      );
+    }
+
+    // -------------------------------------------------
+    // Parse Ollama envelope
+    // -------------------------------------------------
+
+    let ollamaData: any;
+
+    try {
+      ollamaData =
+        JSON.parse(rawOllamaResponse);
+    } catch (error) {
+      console.error(
+        "CEO: Ollama response was not valid JSON."
+      );
+
+      console.error(
+        rawOllamaResponse.slice(0, 4000)
+      );
+
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "Ollama returned an invalid JSON response.",
+        },
+        { status: 502 }
+      );
+    }
+
+    // -------------------------------------------------
+    // Extract assistant content
+    // -------------------------------------------------
+
+    const assistantContent =
+      typeof ollamaData?.message?.content === "string"
+        ? ollamaData.message.content.trim()
+        : "";
+
+    if (!assistantContent) {
+      console.error(
+        "CEO: Ollama response did not contain message.content."
+      );
+
+      console.error(
+        JSON.stringify(
+          ollamaData,
+          null,
+          2
+        )
+      );
+
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "Ollama returned no assistant content.",
+        },
+        { status: 502 }
+      );
+    }
+
+    console.log(
+      "CEO: assistant content received."
+    );
+
+    console.log(
+      "CEO: content length:",
+      assistantContent.length
+    );
+
+    // -------------------------------------------------
+    // Parse CEO JSON plan
+    // -------------------------------------------------
+
+    const cleanedJSON =
+      cleanJSON(
+        assistantContent
+      );
+
+    let plan: any;
+
+    try {
+      plan =
+        JSON.parse(cleanedJSON);
+    } catch (error) {
+      console.error(
+        "CEO: failed to parse CEO plan JSON."
+      );
+
+      console.error(
+        "Cleaned CEO output:"
+      );
+
+      console.error(
+        cleanedJSON.slice(0, 8000)
+      );
+
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "CEO Agent returned invalid plan JSON.",
+          raw:
+            assistantContent.slice(
+              0,
+              4000
+            ),
+        },
+        { status: 502 }
+      );
+    }
+
+    // -------------------------------------------------
+    // Validate plan
+    // -------------------------------------------------
+
+    if (!isValidCEOPlan(plan)) {
+      console.error(
+        "CEO: plan structure validation failed."
+      );
+
+      console.error(
+        JSON.stringify(
+          plan,
+          null,
+          2
+        ).slice(0, 10000)
+      );
+
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            "CEO Agent returned an invalid workforce plan structure.",
+          plan,
+        },
+        { status: 502 }
+      );
+    }
+
+    // -------------------------------------------------
+    // Success
+    // -------------------------------------------------
+
+    const duration =
+      Date.now() - startedAt;
 
     console.log("");
-    console.log("=================================");
-    console.log("MISSION CREATED");
-    console.log("=================================");
     console.log(
-      "Mission ID:",
-      mission.id
+      "================================="
     );
+    console.log(
+      "CEO PLAN CREATED SUCCESSFULLY"
+    );
+    console.log(
+      "================================="
+    );
+
+    console.log(
+      "Objective:",
+      plan.mission.objective
+    );
+
+    console.log(
+      "Agents:",
+      plan.agents.length
+    );
+
     console.log(
       "Tasks:",
-      mission.tasks.length
+      plan.agents.reduce(
+        (
+          total: number,
+          agent: CEOAgentLike
+        ) =>
+          total +
+          agent.tasks.length,
+        0
+      )
     );
-    console.log(
-      "Next Action:",
-      mission.nextAction
-    );
+
     console.log(
       "Final Deliverable:",
-      mission.finalDeliverable
+      plan.finalDeliverable
     );
-    console.log("=================================");
+
+    console.log(
+      "Next Action:",
+      plan.nextAction
+    );
+
+    console.log(
+      "Duration:",
+      `${duration}ms`
+    );
+
+    console.log(
+      "================================="
+    );
     console.log("");
 
     return NextResponse.json({
       success: true,
-      mission,
+
+      model: MODEL,
+
+      result:
+        JSON.stringify(
+          plan,
+          null,
+          2
+        ),
+
+      plan,
+
+      duration,
     });
   } catch (error) {
     console.error("");
@@ -457,7 +653,7 @@ export async function POST(
       "================================="
     );
     console.error(
-      "Kernel POST error"
+      "CEO ROUTE ERROR"
     );
     console.error(
       "================================="
@@ -471,7 +667,7 @@ export async function POST(
         error:
           error instanceof Error
             ? error.message
-            : "Kernel failed.",
+            : "CEO Agent failed.",
       },
       { status: 500 }
     );
@@ -479,127 +675,9 @@ export async function POST(
 }
 
 // =====================================================
-// PATCH
+// INTERNAL TYPE
 // =====================================================
 
-export async function PATCH(
-  request: NextRequest
-) {
-  try {
-    const body = await request.json();
-
-    const missionId =
-      body?.missionId;
-
-    const taskId =
-      body?.taskId;
-
-    const status =
-      body?.status;
-
-    // ---------------------------------------------
-    // Validate missionId
-    // ---------------------------------------------
-
-    if (
-      !missionId ||
-      typeof missionId !== "string"
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "missionId is required.",
-        },
-        { status: 400 }
-      );
-    }
-
-    // ---------------------------------------------
-    // Validate taskId
-    // ---------------------------------------------
-
-    if (
-      !taskId ||
-      typeof taskId !== "string"
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "taskId is required.",
-        },
-        { status: 400 }
-      );
-    }
-
-    // ---------------------------------------------
-    // Validate status
-    // ---------------------------------------------
-
-    const validStatuses = [
-      "Pending",
-      "Running",
-      "Completed",
-      "Failed",
-    ];
-
-    if (
-      !validStatuses.includes(status)
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "Invalid status. Use Pending, Running, Completed, or Failed.",
-        },
-        { status: 400 }
-      );
-    }
-
-    // ---------------------------------------------
-    // Update task
-    // ---------------------------------------------
-
-    const task =
-      kernel.updateTaskStatus(
-        missionId,
-        taskId,
-        status
-      );
-
-    if (!task) {
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "Mission or task not found.",
-        },
-        { status: 404 }
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      task,
-      mission:
-        kernel.getMission(
-          missionId
-        ),
-    });
-  } catch (error) {
-    console.error(
-      "Kernel PATCH error:",
-      error
-    );
-
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to update task.",
-      },
-      { status: 500 }
-    );
-  }
-}
+type CEOAgentLike = {
+  tasks: unknown[];
+};
